@@ -119,6 +119,20 @@ class Search extends Component
     public int $maxPostgresKeywordLength = 2450;
 
     /**
+     * @var int
+     *
+     * Tracks nested queue-batch scope depth so callers can start/end batching safely.
+     */
+    private int $_indexQueueBatchDepth = 0;
+
+    /**
+     * @var array<string,array{element:ElementInterface,allFields:bool,fieldHandles:array<string,bool>}>
+     *
+     * Collects queued element/index requests within a batch and merges field handles per element/site.
+     */
+    private array $_queuedIndexElements = [];
+
+    /**
      * @inheritdoc
      */
     public function init(): void
@@ -226,6 +240,65 @@ class Search extends Component
      * @since 5.7.0
      */
     public function queueIndexElement(ElementInterface $element, array $fieldHandles): void
+    {
+        if ($this->_indexQueueBatchDepth > 0) {
+            $key = sprintf('%s:%d:%d', get_class($element), $element->id, $element->siteId);
+            $queued = $this->_queuedIndexElements[$key] ?? [
+                'element' => $element,
+                'allFields' => false,
+                'fieldHandles' => [],
+            ];
+
+            if (empty($fieldHandles)) {
+                $queued['allFields'] = true;
+                $queued['fieldHandles'] = [];
+            } elseif (!$queued['allFields']) {
+                foreach ($fieldHandles as $fieldHandle) {
+                    $queued['fieldHandles'][$fieldHandle] = true;
+                }
+            }
+
+            $this->_queuedIndexElements[$key] = $queued;
+            return;
+        }
+
+        $this->_queueIndexElementNow($element, $fieldHandles);
+    }
+
+    /**
+     * Starts a queue-index batching scope.
+     */
+    public function beginIndexQueueBatch(): void
+    {
+        $this->_indexQueueBatchDepth++;
+    }
+
+    /**
+     * Ends a queue-index batching scope and flushes merged requests when the outermost scope ends.
+     */
+    public function endIndexQueueBatch(): void
+    {
+        if ($this->_indexQueueBatchDepth === 0) {
+            return;
+        }
+
+        $this->_indexQueueBatchDepth--;
+
+        if ($this->_indexQueueBatchDepth !== 0 || empty($this->_queuedIndexElements)) {
+            return;
+        }
+
+        try {
+            foreach ($this->_queuedIndexElements as $queued) {
+                $fieldHandles = $queued['allFields'] ? [] : array_keys($queued['fieldHandles']);
+                $this->_queueIndexElementNow($queued['element'], $fieldHandles);
+            }
+        } finally {
+            $this->_queuedIndexElements = [];
+        }
+    }
+
+    private function _queueIndexElementNow(ElementInterface $element, array $fieldHandles): void
     {
         try {
             $this->createOrUpdateIndexJob($element, $fieldHandles);
